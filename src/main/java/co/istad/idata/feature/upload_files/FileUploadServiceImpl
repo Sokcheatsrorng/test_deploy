@@ -1,0 +1,267 @@
+package co.istad.idata.feature.upload_files;
+
+import co.istad.idata.domains.Upload;
+import co.istad.idata.domains.UserDefinition;
+import co.istad.idata.feature.api_generation.json_field.DefinitionSchema;
+
+import co.istad.idata.feature.upload_files.dto.FileUploadResponse;
+import co.istad.idata.feature.user_definition.UserDefinitionRepository;
+
+import co.istad.idata.util.MediaUtil;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
+import org.springframework.stereotype.Service;
+import org.springframework.web.multipart.MultipartFile;
+import org.springframework.web.server.ResponseStatusException;
+
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.*;
+
+/**
+ * Service implementation for handling file upload operations.
+ * This class provides methods to store multiple files, load all files, and handle file processing.
+ * It interacts with repositories and mappers to persist file data and generate JSON schemas.
+ *
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class FileUploadServiceImpl implements FileUploadService {
+
+    @Value("${file.server-path}")
+    private String serverPath;
+
+    private final FileUploadRepository fileUploadRepository;
+    private final UploadMapper uploadMapper;
+    private final UserDefinitionRepository userDefinitionRepository;
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    private static final long MAX_FILE_SIZE = 1L * 1024 * 1024 * 1024; // 1GB in bytes
+
+    /**
+     * Processes and stores a single file, converting it to JSON and saving metadata and schema.
+     *
+     * @param file The file to be processed and stored.
+     * @return A response containing metadata about the uploaded file.
+     * @throws IOException If an I/O error occurs during file processing.
+     */
+    public FileUploadResponse processAndStoreFile(MultipartFile file) throws IOException {
+        String fileName = file.getOriginalFilename();
+        String extension = MediaUtil.getExtension(fileName);
+        String filePath;
+
+        // Determine the file path based on the file extension
+        switch (extension.toLowerCase()) {
+            case "csv" ->
+                    filePath = serverPath+"\\csv\\json\\"+ fileName;
+            case "xlsx" ->
+                    filePath = serverPath+"\\excel\\json\\"+ fileName;
+            case "json" ->
+                    filePath = serverPath+"\\json\\"+ fileName;
+            default ->
+                    throw new IllegalArgumentException("Unsupported file type: " + extension);
+        }
+
+        // Check if file with the same name already exists in the upload table
+        if (fileUploadRepository.existsByFileName(fileName)) {
+            throw new IllegalArgumentException("File already imported into database!");
+        }
+
+        // Check if file with the same name already exists in the user definition table
+        if (userDefinitionRepository.existsByTableName(fileName)) {
+            throw new IllegalArgumentException("File has already processed!");
+        }
+
+        // Check file size
+        if (file.getSize() > MAX_FILE_SIZE) {
+            throw new IllegalArgumentException("File size exceeds limit of 1GB!");
+        }
+
+        // Save file to server
+        Path path = Paths.get(filePath);
+        Files.createDirectories(path.getParent());
+        Files.write(path, file.getBytes());
+
+        // Convert file to JSON
+        byte[] fileData = convertFileToJson(filePath, extension);
+
+        // Create and save Upload object
+        Upload upload = new Upload();
+
+        upload.setId(UUID.randomUUID().toString());
+        upload.setFileName(fileName);
+        upload.setMimeType(extension);
+        upload.setFileSize(file.getSize());
+        upload.setData(fileData);
+
+        // Generate and save schema
+        DefinitionSchema schema = generateSchema(fileData, fileName);
+        saveUserDefinition(schema, fileName);
+
+        // Save the Upload object to the repository
+        fileUploadRepository.save(upload);
+
+        // Map the Upload object to FileUploadResponse and return it
+        return uploadMapper.fromUploadFileResponse(upload);
+    }
+
+    /**
+     * Converts a file to JSON format based on its extension.
+     *
+     * @param filePath The path of the file to be converted.
+     * @param extension The file extension.
+     * @return A byte array containing the JSON representation of the file.
+     * @throws IOException If an I/O error occurs during file conversion.
+     */
+    private byte[] convertFileToJson(String filePath, String extension) throws IOException {
+        switch (extension.toLowerCase()) {
+            case "xlsx":
+                return new ExcelToJsonConverter().convertExcelFilesToJson(filePath);
+            case "csv":
+                return new CSVToJsonConverter().convertCSVToJson(filePath);
+            case "json":
+                return Files.readAllBytes(Paths.get(filePath));
+            default:
+                throw new IllegalArgumentException("Unsupported file type: " + extension);
+        }
+    }
+
+    /**
+     * Generates a JSON schema from file data.
+     *
+     * @param fileData The file data as a byte array.
+     * @param fileName The name of the file.
+     * @return The generated JSON schema.
+     * @throws IOException If an I/O error occurs during schema generation.
+     */
+    private DefinitionSchema generateSchema(byte[] fileData, String fileName) throws IOException {
+        ObjectMapper objectMapper = new ObjectMapper();
+        JsonNode jsonNode = objectMapper.readTree(new String(fileData, StandardCharsets.UTF_8));
+        return SchemaGenerator.generateSchemaFromJson(jsonNode, fileName, "Generated schema for " + fileName);
+    }
+
+    /**
+     * Saves the generated schema to the user definition repository.
+     *
+     * @param schema The schema to be saved.
+     * @param fileName The name of the file associated with the schema.
+     */
+    private void saveUserDefinition(DefinitionSchema schema, String fileName) {
+
+        if (schema.getKeys() == null) {
+            schema.setKeys(new ArrayList<>());
+        }
+        if (schema.getProperties() == null) {
+            schema.setProperties(new ArrayList<>());
+        }
+
+        UserDefinition userDefinition = new UserDefinition();
+        userDefinition.setTableName(fileName);
+        userDefinition.setSchema(schema);
+
+        userDefinitionRepository.save(userDefinition);
+    }
+
+    /**
+     * Stores multiple files and returns a list of file upload responses.
+     * This method processes and saves each file, generating metadata and potentially storing data in a database.
+     *
+     * @param files The list of files to be uploaded.
+     * @return A list of file upload responses containing metadata about the uploaded files.
+     * @throws IOException If an I/O error occurs during file processing.
+     */
+    @Override
+    public List<FileUploadResponse> storeFiles(List<MultipartFile> files) throws IOException {
+
+        List<FileUploadResponse> uploadedFiles = new ArrayList<>();
+        for (MultipartFile file : files) {
+            uploadedFiles.add(processAndStoreFile(file));
+        }
+        return uploadedFiles;
+    }
+
+    /**
+     * Loads all files and returns a map of file names to file upload responses.
+     * This method retrieves all stored files and their associated metadata.
+     *
+     * @return A map where the keys are file names and the values are file upload responses.
+     */
+    @Override
+    public Map<String, FileUploadResponse> loadAllFiles() {
+
+        Map<String, FileUploadResponse> fileInfoMap = new HashMap<>();
+        List<Upload> uploads = fileUploadRepository.findAll();
+
+        for (Upload upload : uploads) {
+            FileUploadResponse response = uploadMapper.fromUploadFileResponse(upload);
+            fileInfoMap.put(upload.getFileName(), response);
+        }
+
+        return fileInfoMap;
+    }
+
+    @Override
+    public ResponseEntity<DefinitionSchema> generateSchemaFromJson() {
+
+        // Fetch the UserDefinition by ID
+//       We fetch the latest version of id from userDefinition table and return schema back to user client side
+        Optional<UserDefinition> optionalUserDefinition = userDefinitionRepository.findLatestUserDefinition();
+
+        if (optionalUserDefinition.isEmpty()) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND);
+        }
+
+        UserDefinition userDefinition = optionalUserDefinition.get();
+
+        // Extract the DefinitionSchema
+        DefinitionSchema schema = userDefinition.getSchema();
+
+        if (schema == null) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND);
+        }
+
+        // Return the schema
+        return ResponseEntity.ok(schema);
+    }
+
+    @Override
+    public DefinitionSchema updateSchemaFromJson(UpdateSchemaFromJsonRequest request, Long id) {
+
+        // Fetch the UserDefinition by ID
+        Optional<UserDefinition> optionalUserDefinition = userDefinitionRepository.findById(id);
+
+        if (optionalUserDefinition.isEmpty()) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND);
+        }
+
+        UserDefinition userDefinition = optionalUserDefinition.get();
+
+        // Extract the DefinitionSchema
+        DefinitionSchema schema = userDefinition.getSchema();
+
+        if (schema == null) {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND);
+        }
+
+        // Update the schema
+        schema.setKeys(request.keys());
+        schema.setProperties(request.properties());
+
+        // Save the updated schema
+        userDefinition.setSchema(schema);
+        userDefinitionRepository.save(userDefinition);
+
+        return schema;
+    }
+
+
+}
